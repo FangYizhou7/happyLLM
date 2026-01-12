@@ -1,3 +1,4 @@
+import math
 from typing import Tuple
 
 import torch
@@ -41,6 +42,63 @@ class Attention(nn.Module):
         self.attn_dropout=nn.Dropout(args.dropout)
         self.resid_dropout=nn.Dropout(args.dropout)
 
+        #保存dropout概率
+        self.dropout=args.dropout
+
+        #检查是否使用Flash Attention
+        self.flash=hasattr(torch.nn.functional,'scaled_dot_product_attention')
+
+        if not self.flash:
+            # 若不支持flash attention,则使用手动实现的注意力机制,并设置mask
+            print("WARNING:using slow attention, flash Attention requires Pytorch>=2.0")
+            #创建一个上三角矩阵 用于遮蔽未来信息
+            mask = torch.full((1, 1, args.max_seq_len, args.max_seq_len), float("-inf"))
+            mask = torch.triu(mask, diagonal=1)
+            # 注册为模型的缓冲区
+            self.register_buffer("mask",mask)
+
+    def forward(self,x:torch.Tensor,freq_cos:torch.Tensor,freq_sin:torch.Tensor):
+        # 获取批次大小和序列长度 [batch_size,seq_len,dim]
+        bsz,seqlen,_=x.shape
+
+        # 计算 查询 Q,K,V
+        xq,xk,xv=self.wq(x),self.wk(x),self.wv(x)
+
+        xq=xq.view(bsz,seqlen,self.n_local_heads,self.head_dim)
+        xk=xk.view(bsz,seqlen,self.n_local_kv_heads,self.head_dim)
+        xv=xv.view(bsz,seqlen,self.n_local_kv_heads,self.head_dim)
+
+        # 应用旋转位置嵌入(RoPE)
+        xq,xk=apply_rotary_emb(xq,xk,freq_cos,freq_sin)
+
+        #对键和值进行扩展以适应重复次数
+        xk=repeat_kv(xk,self.n_rep)
+        xv=repeat_kv(xv,self.n_rep)
+
+        #将头作为批次 维度处理
+        xq=xq.transpose(1,2)
+        xk=xk.transpose(1,2)
+        xv=xv.transpose(1,2)
+
+        if self.falsh:
+            output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+
+        else:
+            # 使用手动实现注意力机制
+            scores=torch.matmul(xq,xk.transpose(2,3))/math.sqrt(self.head_dim)
+            assert hasattr(self,'mask')
+            scores = scores + self.mask[:, :, :seqlen, :seqlen]
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = torch.matmul(scores, xv)
+
+        #恢复时间维度合并头
+        output=output.transpose(1,2).contiguous().view(bsz,seqlen,-1)
+
+        # 最终投影会残差流
+        output=self.wo(output)
+        output=self.resid_dropout(output)
+        return output
 
 
 
