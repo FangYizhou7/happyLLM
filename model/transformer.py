@@ -1,12 +1,15 @@
+import math
 from typing import Optional
 
 import torch
 from torch import nn
 from transformers import PreTrainedModel
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from config.ModelConfig import ModelConfig, RMSNorm
 from model.attention import precompute_freqs_cis
 from model.decoderLayer import DecoderLayer
+import torch.nn.functional as F
 
 
 class Transformer(PreTrainedModel):
@@ -46,3 +49,75 @@ class Transformer(PreTrainedModel):
 
         #预计算相对位置嵌入的概率
         freqs_cos,freqs_sin=precompute_freqs_cis(self.args.dim//self.args.n_heads,self.args.max_seq_len)
+        self.register_buffer('freqs_cos',freqs_cos,persistent=False)
+        self.register_buffer('freqs_sin',freqs_sin,persistent=False)
+
+        #初始化所有权重
+        self.apply(self._init_weights)
+
+        #对残差投影进行特殊的缩放初始化
+        for pn, p in self.named_parameters():
+            if pn.endswith('w3.weight') or pn.endswith('wo.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * args.n_layers))
+
+        #初始化最后一次前向传播的损失属性
+        self.last_loss=None
+        self.OUT=CausalLMOutputWithPast()
+        self._no_split_modules =[name for name,_ in self.named_modules()]
+
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
+        """
+        - tokens: Optional[torch.Tensor], 输入 token 张量。
+        - targets: Optional[torch.Tensor], 目标 token 张量。
+        - kv_cache: bool, 是否使用键值缓存。
+        - kwargs: 其他关键字参数。
+
+        - self.OUT: CausalLMOutputWithPast, 包含 logits 和损失。
+        """
+
+        if 'input_ids' in kwargs:
+            tokens = kwargs['input_ids']
+        if 'attention_mask' in kwargs:
+            targets = kwargs['attention_mask']
+
+        # 前向传播函数
+        _bsz, seqlen = tokens.shape
+        # 通过词嵌入层和Dropout层
+        h = self.tok_embeddings(tokens)
+        h = self.dropout(h)
+        # 获取相对位置嵌入的频率
+        freqs_cos = self.freqs_cos[:seqlen]
+        freqs_sin = self.freqs_sin[:seqlen]
+
+        # 通过Decoder层
+        for layer in self.layers:
+            h = layer(h, freqs_cos, freqs_sin)
+        # 通过归一化层
+        h = self.norm(h)
+
+        if targets is not None:
+            # 如果给定了目标，计算损失
+            logits = self.output(h)
+            self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=0, reduction='none')
+        else:
+            # 推理时的小优化：只对最后一个位置的输出进行前向传播
+            logits = self.output(h[:, [-1], :])
+            self.last_loss = None
+
+        # 设置输出
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('last_loss', self.last_loss)
+        return self.OUT
+
+    @torch.inference_mode()
+    def generate(self,idx,stop_id=None,max_new_tokens=256,temperature=1.0,top_k=None):
+        index=idx.shape[1]
