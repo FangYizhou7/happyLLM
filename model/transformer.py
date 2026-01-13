@@ -121,3 +121,41 @@ class Transformer(PreTrainedModel):
     @torch.inference_mode()
     def generate(self,idx,stop_id=None,max_new_tokens=256,temperature=1.0,top_k=None):
         index=idx.shape[1]
+        for _ in range(max_new_tokens):
+            # 如果序列过长 截断它到最大长度
+            idx_cond = idx if idx.size(1) <= self.args.max_seq_len else idx[:, -self.args.max_seq_len:]
+
+            #前向传播获取序列中最后一个位置的logits
+            logits=self(idx_cond).logits
+            logits=logits[:,-1,:]  #只保留最后一个时间步的输出
+
+            if temperature == 0.0:
+                # 选择最有可能的索引
+                _, idx_next = torch.topk(logits, k=1, dim=-1)
+            else:
+                # 缩放 logits 并应用 softmax
+                logits = logits / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
+            if idx_next==stop_id:
+                break
+
+            #将采样的索引添加到序列中并继续
+            idx=torch.cat((idx,idx_next),dim=1)
+        return idx[:,index:]
+# LLaMA2Model.forward 接受两个参数，tokens和targets，其中tokens是输入的张量, 应为int类型
+args = ModelConfig()
+x = torch.randint(0, 6144, (1, 50)) # [bs, seq_len]
+# 实例化LLaMA2Model
+model = Transformer(args=args)
+# 计算model的全部参数
+num_params = sum(p.numel() for p in model.parameters())
+print('Number of parameters:', num_params)
+
+out = model(x)
+print(out.logits.shape) # [batch_size, 1, vocab_size]
+

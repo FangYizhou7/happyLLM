@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from config.ModelConfig import ModelConfig
-
+import torch.nn.functional as F
 
 class Attention(nn.Module):
     def __init__(self,args:ModelConfig):
@@ -80,7 +80,7 @@ class Attention(nn.Module):
         xk=xk.transpose(1,2)
         xv=xv.transpose(1,2)
 
-        if self.falsh:
+        if self.flash:
             output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
 
         else:
